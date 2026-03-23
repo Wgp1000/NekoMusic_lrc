@@ -1,6 +1,3 @@
-{"t":0,"c":[{"tx":"作词: "},{"tx":"黄伟文","li":"http://p1.music.126.net/gdMjJpaNMmzhZBokPWc9gg==/260584255800031.jpg","or":"orpheus://nm/artist/home?id=3078&type=artist"}]}
-{"t":191,"c":[{"tx":"作曲: "},{"tx":"Enoch Cheng"},{"tx":"/"},{"tx":"Gareth.T"},{"tx":"/"},{"tx":"Nic Tsui"},{"tx":"/"},{"tx":"Teddy Fan","li":"http://p1.music.126.net/cozhmglD_jci8EFYGw8_eA==/109951172687150256.jpg","or":"orpheus://nm/artist/home?id=37231832&type=artist"},{"tx":"/"},{"tx":"Tom Wong"}]}
-{"t":382,"c":[{"tx":"编曲: "},{"tx":"Brian Yip"},{"tx":"/"},{"tx":"Enoch Cheng"},{"tx":"/"},{"tx":"Gareth.T"},{"tx":"/"},{"tx":"Lee Yat Ding"},{"tx":"/"},{"tx":"Nic Tsui"},{"tx":"/"},{"tx":"Patrick Yip"},{"tx":"/"},{"tx":"Teddy Fan","li":"http://p1.music.126.net/cozhmglD_jci8EFYGw8_eA==/109951172687150256.jpg","or":"orpheus://nm/artist/home?id=37231832&type=artist"},{"tx":"/"},{"tx":"Tom Wong"}]}
 [00:00.573] 遗憾要告诉你
 [00:04.515] 不必抛出你钓我的饵
 [00:08.631] 贪些少金箔上当的人
@@ -50,18 +47,3 @@
 [02:56.320]
 [02:58.586] Woo, woo, woo
 [03:06.800] Woo, woo 闪爆你
-{"t":194711,"c":[{"tx":"原声吉他: "},{"tx":"Nic Tsui"}]}
-{"t":195044,"c":[{"tx":"和声: "},{"tx":"Gareth.T"},{"tx":"/"},{"tx":"MC Cheung Tinfu"},{"tx":"/"},{"tx":"Nic Tsui"},{"tx":"/"},{"tx":"Patrick Yip"}]}
-{"t":195377,"c":[{"tx":"鼓: "},{"tx":"Lee Yat Ding"}]}
-{"t":195710,"c":[{"tx":"号编曲: "},{"tx":"Brian Yip"},{"tx":"/"},{"tx":"Gareth.T"}]}
-{"t":196043,"c":[{"tx":"录音: "},{"tx":"Avon Recording Studio"}]}
-{"t":196376,"c":[{"tx":"人声: "},{"tx":"Gareth.T"},{"tx":"/"},{"tx":"MC Cheung Tinfu"},{"tx":"/"},{"tx":"Nic Tsui"},{"tx":"/"},{"tx":"Patrick Yip"}]}
-{"t":196709,"c":[{"tx":"钢琴: "},{"tx":"Enoch Cheng"}]}
-{"t":197042,"c":[{"tx":"电钢琴: "},{"tx":"Patrick Yip"}]}
-{"t":197375,"c":[{"tx":"贝斯: "},{"tx":"Tom Wong"}]}
-{"t":197708,"c":[{"tx":"电吉他: "},{"tx":"Teddy Fan","li":"http://p1.music.126.net/cozhmglD_jci8EFYGw8_eA==/109951172687150256.jpg","or":"orpheus://nm/artist/home?id=37231832&type=artist"}]}
-{"t":198041,"c":[{"tx":"母带工程师: "},{"tx":"Alex Psaudarakis"}]}
-{"t":198374,"c":[{"tx":"长号: "},{"tx":"Bernardino Overon"}]}
-{"t":198707,"c":[{"tx":"人声录音工程师: "},{"tx":"Tsamchan"}]}
-{"t":199040,"c":[{"tx":"人声录音: "},{"tx":"Gareth.T"},{"tx":"/"},{"tx":"Nic Tsui"},{"tx":"/"},{"tx":"Patrick Yip"}]}
-{"t":199373,"c":[{"tx":"混音师: "},{"tx":"Jay Tse"}]}

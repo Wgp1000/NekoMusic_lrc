@@ -1,8 +1,3 @@
-{"t":0,"c":[{"tx":"作词: "},{"tx":"Bruno Mars"},{"tx":"/"},{"tx":"Brody Brown"},{"tx":"/"},{"tx":"Dernst Emile II"}]}
-{"t":1000,"c":[{"tx":"作曲: "},{"tx":"Bruno Mars"},{"tx":"/"},{"tx":"Brody Brown"},{"tx":"/"},{"tx":"Dernst Emile II"}]}
-{"t":2000,"c":[{"tx":"编曲: "},{"tx":"Steven Tirpak"}]}
-{"t":3000,"c":[{"tx":"制作人: "},{"tx":"D’Mile"},{"tx":"/"},{"tx":"Bruno Mars"}]}
-{"t":4000,"c":[{"tx":"指挥家: "},{"tx":"Larry Gold"}]}
 [00:16.923] Woo, woo (Ooh)
 [00:20.336] Woo, woo (Ooh)
 [00:25.019] Ah
@@ -55,18 +50,3 @@
 [03:57.695] Let me show you I can make it right
 [04:02.031]
 [04:04.315] Oh, I can make it right, tonight
-{"t":249360,"c":[{"tx":"音频助理: "},{"tx":"Alex Resoagli"}]}
-{"t":249693,"c":[{"tx":"音频工程师: "},{"tx":"Charles Moniz"}]}
-{"t":250026,"c":[{"tx":"吉他: "},{"tx":"Chris Payton"}]}
-{"t":250359,"c":[{"tx":"键盘: "},{"tx":"John Fossitt"}]}
-{"t":250692,"c":[{"tx":"鼓: "},{"tx":"Carlin White"}]}
-{"t":251025,"c":[{"tx":"人声: "},{"tx":"Bruno Mars"}]}
-{"t":251358,"c":[{"tx":"大提琴: "},{"tx":"Glenn Fischbach"}]}
-{"t":251691,"c":[{"tx":"小提琴: "},{"tx":"Emma Kummrow"},{"tx":"/"},{"tx":"Natasha Colkett"},{"tx":"/"},{"tx":"Gared Crawford"},{"tx":"/"},{"tx":"Blake Espy"},{"tx":"/"},{"tx":"Tess Varley"},{"tx":"/"},{"tx":"Luigi Mazzocchi"}]}
-{"t":252024,"c":[{"tx":"打击乐: "},{"tx":"Eric Hernandez"}]}
-{"t":252357,"c":[{"tx":"中提琴: "},{"tx":"Jonathan Kim"},{"tx":"/"},{"tx":"Yoshihiko Nakano"}]}
-{"t":252690,"c":[{"tx":"康加鼓: "},{"tx":"Daniel Rodriguez"}]}
-{"t":253023,"c":[{"tx":"贝斯: "},{"tx":"Jamareo Artis"}]}
-{"t":253356,"c":[{"tx":"母带工程师: "},{"tx":"Randy Merrill"}]}
-{"t":253689,"c":[{"tx":"混音工程师: "},{"tx":"Bryce Bordone"}]}
-{"t":254022,"c":[{"tx":"混音师: "},{"tx":"Serban Ghenea"}]}
