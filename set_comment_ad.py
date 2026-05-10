@@ -7,6 +7,8 @@
 - WAV：若存在 ffmpeg，先无损写入 RIFF 侧 comment（部分播放器只读这一层），再写 ID3 COMM；
   否则仅写 ID3。保存前 chmod 增加本用户写权限；权限仍失败时用临时文件再 os.replace。
 - 若 .mp3 / .flac 实际为 MP4，则回退写入 MP4 的 ©cmt。
+- 嵌入歌词（非外部 .lrc）：在已有内嵌歌词最前插入两行 LRC 轴文案；无歌词则仅写入该两行。
+  MP3/WAV 用 ID3 USLT；FLAC 用 Vorbis「lyrics」；MP4 用 ©lyr。已以相同首行开头则跳过。
 
 在仓库根目录执行：python3 set_comment_ad.py
 """
@@ -22,7 +24,7 @@ import tempfile
 from pathlib import Path
 
 from mutagen.flac import FLAC, FLACNoHeaderError
-from mutagen.id3 import COMM, TPUB, TXXX
+from mutagen.id3 import COMM, TPUB, TXXX, USLT
 from mutagen.mp3 import MP3, HeaderNotFoundError
 from mutagen.mp4 import MP4, MP4FreeForm
 from mutagen.wave import WAVE
@@ -35,9 +37,18 @@ COMMENT = (
 ORGANIZATION = "Neko Music"
 PUBLISHER = "music.cnmsb.xin"
 
+# 内嵌歌词（LRC 时间轴）横幅，写在已有歌词最前
+LYRICS_BANNER = (
+    "[00:00.00]资源来自Neko云音乐 Resources from Neko Cloud Music\n"
+    "\n"
+    "[00:00.10]获取更多无损音乐https://music.cnmsb.xin/ Get more lossless music at https://music.cnmsb.xin/\n"
+)
+LYRICS_BANNER_FIRST = "[00:00.00]资源来自Neko云音乐 Resources from Neko Cloud Music"
+
 # 脚本在仓库根目录，音频在子目录 music/
 AUDIO_DIR = Path(__file__).resolve().parent / "music"
 MP4_COMMENT = "\xa9cmt"
+MP4_LYRICS = "\xa9lyr"
 # iTunes 自由格式，便于与部分工具中的 ORGANIZATION / PUBLISHER 名称对齐
 MP4_FF_ORGANIZATION = "----:com.apple.iTunes:ORGANIZATION"
 MP4_FF_PUBLISHER = "----:com.apple.iTunes:PUBLISHER"
@@ -70,6 +81,65 @@ def _set_id3_organization_publisher(tags) -> None:
     tags.add(TXXX(encoding=3, desc="ORGANIZATION", text=ORGANIZATION))
 
 
+def _prepend_embedded_lyrics_id3(tags) -> None:
+    """在 ID3 内嵌歌词（USLT）最前插入 LYRICS_BANNER；无 USLT 则新建。"""
+    uslt_keys = [k for k in list(tags.keys()) if k.startswith("USLT")]
+    if not uslt_keys:
+        tags.add(
+            USLT(encoding=3, lang="zho", desc="", text=LYRICS_BANNER.rstrip("\n"))
+        )
+        return
+    parts: list[str] = []
+    lang = "zho"
+    for k in sorted(uslt_keys):
+        fr = tags[k]
+        parts.append(getattr(fr, "text", "") or "")
+        if getattr(fr, "lang", None):
+            lang = fr.lang or lang
+    body = "\n\n".join(p for p in parts if p.strip())
+    if body.strip():
+        first = body.lstrip("\ufeff").splitlines()[0]
+        if first.strip() == LYRICS_BANNER_FIRST.strip():
+            return
+        new_text = (LYRICS_BANNER + body).rstrip("\n")
+    else:
+        new_text = LYRICS_BANNER.rstrip("\n")
+    for k in uslt_keys:
+        del tags[k]
+    tags.add(USLT(encoding=3, lang=lang, desc="", text=new_text))
+
+
+def _prepend_flac_embedded_lyrics(audio: FLAC) -> None:
+    body: str | None = None
+    for key in ("lyrics", "LYRICS"):
+        if key in audio:
+            body = "\n\n".join(audio[key])
+            break
+    if body is None:
+        audio["lyrics"] = [LYRICS_BANNER.rstrip("\n")]
+        return
+    if body.strip():
+        lines = body.lstrip("\ufeff").splitlines()
+        first = lines[0] if lines else ""
+        if first.strip() == LYRICS_BANNER_FIRST.strip():
+            return
+    audio["lyrics"] = [(LYRICS_BANNER + body).rstrip("\n")]
+
+
+def _prepend_mp4_embedded_lyrics(audio: MP4) -> None:
+    k = MP4_LYRICS
+    if k not in audio or not audio[k]:
+        audio[k] = [LYRICS_BANNER.rstrip("\n")]
+        return
+    cur = "\n".join(audio[k])
+    if cur.strip():
+        lines = cur.lstrip("\ufeff").splitlines()
+        first = lines[0] if lines else ""
+        if first.strip() == LYRICS_BANNER_FIRST.strip():
+            return
+    audio[k] = [(LYRICS_BANNER + cur).rstrip("\n")]
+
+
 def patch_mp3(path: Path) -> None:
     audio = MP3(str(path))
     if audio.tags is None:
@@ -77,6 +147,7 @@ def patch_mp3(path: Path) -> None:
     _strip_comm_id3(audio.tags)
     audio.tags.add(COMM(encoding=3, lang="zho", desc="", text=COMMENT))
     _set_id3_organization_publisher(audio.tags)
+    _prepend_embedded_lyrics_id3(audio.tags)
     audio.save()
 
 
@@ -85,6 +156,7 @@ def patch_flac(path: Path) -> None:
     audio["comment"] = [COMMENT]
     audio["ORGANIZATION"] = [ORGANIZATION]
     audio["PUBLISHER"] = [PUBLISHER]
+    _prepend_flac_embedded_lyrics(audio)
     audio.save()
 
 
@@ -93,6 +165,7 @@ def patch_mp4(path: Path) -> None:
     audio[MP4_COMMENT] = [COMMENT]
     audio[MP4_FF_ORGANIZATION] = [MP4FreeForm(ORGANIZATION.encode("utf-8"))]
     audio[MP4_FF_PUBLISHER] = [MP4FreeForm(PUBLISHER.encode("utf-8"))]
+    _prepend_mp4_embedded_lyrics(audio)
     audio.save()
 
 
@@ -103,6 +176,7 @@ def _wav_apply_id3_comm(path: Path) -> None:
     _strip_comm_id3(audio.tags)
     audio.tags.add(COMM(encoding=3, lang="zho", desc="", text=COMMENT))
     _set_id3_organization_publisher(audio.tags)
+    _prepend_embedded_lyrics_id3(audio.tags)
     try:
         audio.save()
     except PermissionError:
@@ -128,6 +202,7 @@ def _wav_apply_id3_comm_via_temp(path: Path) -> None:
         _strip_comm_id3(audio.tags)
         audio.tags.add(COMM(encoding=3, lang="zho", desc="", text=COMMENT))
         _set_id3_organization_publisher(audio.tags)
+        _prepend_embedded_lyrics_id3(audio.tags)
         audio.save()
         os.replace(tmp, path)
     finally:
