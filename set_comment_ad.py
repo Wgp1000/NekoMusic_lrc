@@ -39,11 +39,10 @@ PUBLISHER = "music.cnmsb.xin"
 
 # 内嵌歌词（LRC 时间轴）横幅，写在已有歌词最前
 LYRICS_BANNER = (
-    "[00:00.00]资源来自Neko云音乐 Resources from Neko Cloud Music\n"
-    "\n"
+    "[00:00.05]资源来自Neko云音乐 Resources from Neko Cloud Music\n"
     "[00:00.10]获取更多无损音乐https://music.cnmsb.xin/ Get more lossless music at https://music.cnmsb.xin/\n"
 )
-LYRICS_BANNER_FIRST = "[00:00.00]资源来自Neko云音乐 Resources from Neko Cloud Music"
+LYRICS_BANNER_FIRST = "[00:00.05]资源来自Neko云音乐 Resources from Neko Cloud Music"
 
 # 脚本在仓库根目录，音频在子目录 music/
 AUDIO_DIR = Path(__file__).resolve().parent / "music"
