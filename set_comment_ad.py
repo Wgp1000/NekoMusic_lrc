@@ -2,8 +2,8 @@
 """
 为 music 目录下所有 MP3 / FLAC / WAV（不递归子目录）写入统一的「注释」广告文案。
 
-- MP3：ID3 COMM（UTF-8），并删除已有 COMM。
-- FLAC：Vorbis COMMENT。
+- MP3：ID3 COMM（UTF-8），并删除已有 COMM；ORGANIZATION（TXXX）、PUBLISHER（TPUB）。
+- FLAC：Vorbis COMMENT、ORGANIZATION、PUBLISHER。
 - WAV：若存在 ffmpeg，先无损写入 RIFF 侧 comment（部分播放器只读这一层），再写 ID3 COMM；
   否则仅写 ID3。保存前 chmod 增加本用户写权限；权限仍失败时用临时文件再 os.replace。
 - 若 .mp3 / .flac 实际为 MP4，则回退写入 MP4 的 ©cmt。
@@ -22,9 +22,9 @@ import tempfile
 from pathlib import Path
 
 from mutagen.flac import FLAC, FLACNoHeaderError
-from mutagen.id3 import COMM
+from mutagen.id3 import COMM, TPUB, TXXX
 from mutagen.mp3 import MP3, HeaderNotFoundError
-from mutagen.mp4 import MP4
+from mutagen.mp4 import MP4, MP4FreeForm
 from mutagen.wave import WAVE
 
 COMMENT = (
@@ -32,9 +32,15 @@ COMMENT = (
     "For more free lossless music, visit Neko Cloud Music: https://music.cnmsb.xin"
 )
 
+ORGANIZATION = "Neko Music"
+PUBLISHER = "music.cnmsb.xin"
+
 # 脚本在仓库根目录，音频在子目录 music/
 AUDIO_DIR = Path(__file__).resolve().parent / "music"
 MP4_COMMENT = "\xa9cmt"
+# iTunes 自由格式，便于与部分工具中的 ORGANIZATION / PUBLISHER 名称对齐
+MP4_FF_ORGANIZATION = "----:com.apple.iTunes:ORGANIZATION"
+MP4_FF_PUBLISHER = "----:com.apple.iTunes:PUBLISHER"
 
 
 def _ensure_user_writable(path: Path) -> None:
@@ -51,24 +57,42 @@ def _strip_comm_id3(tags) -> None:
             del tags[key]
 
 
+def _set_id3_organization_publisher(tags) -> None:
+    """ID3：发行方 ORGANIZATION（TXXX）、出版者 PUBLISHER（TPUB 标准帧）。"""
+    for key in list(tags.keys()):
+        if key == "TPUB":
+            del tags[key]
+        elif key.startswith("TXXX:"):
+            frame = tags[key]
+            if getattr(frame, "desc", "") == "ORGANIZATION":
+                del tags[key]
+    tags.add(TPUB(encoding=3, text=PUBLISHER))
+    tags.add(TXXX(encoding=3, desc="ORGANIZATION", text=ORGANIZATION))
+
+
 def patch_mp3(path: Path) -> None:
     audio = MP3(str(path))
     if audio.tags is None:
         audio.add_tags()
     _strip_comm_id3(audio.tags)
     audio.tags.add(COMM(encoding=3, lang="zho", desc="", text=COMMENT))
+    _set_id3_organization_publisher(audio.tags)
     audio.save()
 
 
 def patch_flac(path: Path) -> None:
     audio = FLAC(str(path))
     audio["comment"] = [COMMENT]
+    audio["ORGANIZATION"] = [ORGANIZATION]
+    audio["PUBLISHER"] = [PUBLISHER]
     audio.save()
 
 
 def patch_mp4(path: Path) -> None:
     audio = MP4(str(path))
     audio[MP4_COMMENT] = [COMMENT]
+    audio[MP4_FF_ORGANIZATION] = [MP4FreeForm(ORGANIZATION.encode("utf-8"))]
+    audio[MP4_FF_PUBLISHER] = [MP4FreeForm(PUBLISHER.encode("utf-8"))]
     audio.save()
 
 
@@ -78,6 +102,7 @@ def _wav_apply_id3_comm(path: Path) -> None:
         audio.add_tags()
     _strip_comm_id3(audio.tags)
     audio.tags.add(COMM(encoding=3, lang="zho", desc="", text=COMMENT))
+    _set_id3_organization_publisher(audio.tags)
     try:
         audio.save()
     except PermissionError:
@@ -102,6 +127,7 @@ def _wav_apply_id3_comm_via_temp(path: Path) -> None:
             audio.add_tags()
         _strip_comm_id3(audio.tags)
         audio.tags.add(COMM(encoding=3, lang="zho", desc="", text=COMMENT))
+        _set_id3_organization_publisher(audio.tags)
         audio.save()
         os.replace(tmp, path)
     finally:
