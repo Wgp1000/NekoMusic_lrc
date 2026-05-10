@@ -4,14 +4,21 @@
 
 - MP3：ID3 COMM（UTF-8），并删除已有 COMM。
 - FLAC：Vorbis COMMENT。
-- WAV：RIFF 内嵌 id3 块，COMM 规则与 MP3 相同；若无 id3 则创建。
+- WAV：若存在 ffmpeg，先无损写入 RIFF 侧 comment（部分播放器只读这一层），再写 ID3 COMM；
+  否则仅写 ID3。保存前 chmod 增加本用户写权限；权限仍失败时用临时文件再 os.replace。
 - 若 .mp3 / .flac 实际为 MP4，则回退写入 MP4 的 ©cmt。
 
 在仓库根目录执行：python3 set_comment_ad.py
 """
 from __future__ import annotations
 
+import errno
+import os
+import shutil
+import stat
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from mutagen.flac import FLAC, FLACNoHeaderError
@@ -28,6 +35,14 @@ COMMENT = (
 # 脚本在仓库根目录，音频在子目录 music/
 AUDIO_DIR = Path(__file__).resolve().parent / "music"
 MP4_COMMENT = "\xa9cmt"
+
+
+def _ensure_user_writable(path: Path) -> None:
+    try:
+        mode = path.stat().st_mode
+        os.chmod(path, mode | stat.S_IWUSR)
+    except OSError:
+        pass
 
 
 def _strip_comm_id3(tags) -> None:
@@ -57,13 +72,89 @@ def patch_mp4(path: Path) -> None:
     audio.save()
 
 
-def patch_wav(path: Path) -> None:
+def _wav_apply_id3_comm(path: Path) -> None:
     audio = WAVE(str(path))
     if audio.tags is None:
         audio.add_tags()
     _strip_comm_id3(audio.tags)
     audio.tags.add(COMM(encoding=3, lang="zho", desc="", text=COMMENT))
-    audio.save()
+    try:
+        audio.save()
+    except PermissionError:
+        _wav_apply_id3_comm_via_temp(path)
+    except OSError as e:
+        if e.errno in (errno.EACCES, errno.EPERM):
+            _wav_apply_id3_comm_via_temp(path)
+        else:
+            raise
+
+
+def _wav_apply_id3_comm_via_temp(path: Path) -> None:
+    fd, raw = tempfile.mkstemp(
+        suffix=".wav", prefix=f".{path.stem}.", dir=str(path.parent)
+    )
+    os.close(fd)
+    tmp = Path(raw)
+    try:
+        shutil.copy2(path, tmp)
+        audio = WAVE(str(tmp))
+        if audio.tags is None:
+            audio.add_tags()
+        _strip_comm_id3(audio.tags)
+        audio.tags.add(COMM(encoding=3, lang="zho", desc="", text=COMMENT))
+        audio.save()
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+
+
+def _patch_wav_ffmpeg_riff_then_id3(path: Path) -> None:
+    """先 ffmpeg 写 RIFF comment，再 mutagen 写 ID3 COMM，最后原子替换。"""
+    tmp = path.parent / f".{path.name}.ff.{os.getpid()}.wav"
+    try:
+        r = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(path),
+                "-c:a",
+                "copy",
+                "-metadata",
+                f"comment={COMMENT}",
+                str(tmp),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode != 0:
+            msg = (r.stderr or r.stdout or "").strip() or f"退出码 {r.returncode}"
+            raise RuntimeError(msg[:800])
+        _wav_apply_id3_comm(tmp)
+        os.replace(tmp, path)
+    except BaseException:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def patch_wav(path: Path) -> None:
+    _ensure_user_writable(path)
+    if shutil.which("ffmpeg"):
+        try:
+            _patch_wav_ffmpeg_riff_then_id3(path)
+            return
+        except Exception:
+            pass
+    _wav_apply_id3_comm(path)
 
 
 def process_file(path: Path) -> None:
