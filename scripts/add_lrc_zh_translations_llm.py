@@ -107,6 +107,8 @@ class ProcessStats:
     skipped_meta: int = 0
     dropped_redundant: int = 0
     dropped_invalid: int = 0
+    still_missing: int = 0
+    retried: int = 0
 
 
 _lock = threading.Lock()
@@ -173,11 +175,18 @@ def meaningful_chars(s: str) -> int:
     )
 
 
+def is_placeholder_line(text: str) -> bool:
+    t = text.strip()
+    return bool(re.fullmatch(r"[.…·\s]+", t))
+
+
 def is_metadata_line(text: str) -> bool:
     t = text.strip()
     if not t:
         return True
     if PLACEHOLDER in t:
+        return True
+    if is_placeholder_line(t):
         return True
     return any(t.startswith(p) for p in METADATA_PREFIXES)
 
@@ -293,6 +302,9 @@ def sanitize_translation(orig: str, trans: str, stats: ProcessStats) -> str:
     trans = to_simplified(trans.strip())
     if not trans:
         return ""
+    if is_placeholder_line(trans):
+        stats.dropped_invalid += 1
+        return ""
     if classify_skip(orig):
         stats.dropped_invalid += 1
         return ""
@@ -381,6 +393,28 @@ def strip_existing_translations(lines: list[str]) -> list[str]:
     return out
 
 
+def find_missing_translations(lines: list[str]) -> list[tuple[int, str]]:
+    """需要外语对照但下一行尚无 {"..."} 的行。"""
+    missing: list[tuple[int, str]] = []
+    skip_next = False
+    for i, line in enumerate(lines):
+        if skip_next:
+            skip_next = False
+            continue
+        m = TS_LINE.match(line)
+        if not m:
+            continue
+        lyric = m.group(2).strip()
+        if not lyric or classify_skip(lyric):
+            continue
+        nxt = lines[i + 1].strip() if i + 1 < len(lines) else ""
+        if parse_json_line(nxt) is not None:
+            skip_next = True
+            continue
+        missing.append((i, lyric))
+    return missing
+
+
 def collect_pending(lines: list[str], replace_existing: bool) -> list[tuple[int, str]]:
     pending: list[tuple[int, str]] = []
     skip_next = False
@@ -405,6 +439,13 @@ def collect_pending(lines: list[str], replace_existing: bool) -> list[tuple[int,
     return pending
 
 
+def file_has_missing_translations(path: Path) -> bool:
+    text = path.read_text(encoding="utf-8-sig", errors="replace")
+    if PLACEHOLDER in text and PLACEHOLDER == text.strip():
+        return False
+    return bool(find_missing_translations(text.splitlines()))
+
+
 def process_file(
     path: Path,
     api_key: str,
@@ -412,11 +453,11 @@ def process_file(
     model: str,
     batch_size: int,
     replace_existing: bool,
-) -> tuple[bool, ProcessStats]:
+) -> tuple[bool, ProcessStats, bool]:
     stats = ProcessStats()
     text = path.read_text(encoding="utf-8-sig", errors="replace")
     if PLACEHOLDER in text and PLACEHOLDER == text.strip():
-        return False, stats
+        return False, stats, True
 
     lines = text.splitlines()
     if replace_existing:
@@ -424,7 +465,7 @@ def process_file(
 
     pending = collect_pending(lines, False)
     if not pending:
-        return False, stats
+        return False, stats, True
 
     need_llm: list[tuple[int, str]] = []
     local_empty: dict[int, str] = {}
@@ -457,6 +498,23 @@ def process_file(
             translations[idx] = cleaned
         time.sleep(0.2)
 
+    retry: list[tuple[int, str]] = [
+        (i, orig) for i, orig in need_llm if not translations.get(i, "").strip()
+    ]
+    if retry:
+        for start in range(0, len(retry), min(batch_size, 10)):
+            chunk = retry[start : start + min(batch_size, 10)]
+            idxs = [i for i, _ in chunk]
+            src = [t for _, t in chunk]
+            raw = chat_translate(src, api_key, base_url, model)
+            for idx, orig, trans in zip(idxs, src, raw):
+                cleaned = sanitize_translation(orig, trans, stats)
+                if cleaned:
+                    stats.translated += 1
+                    stats.retried += 1
+                translations[idx] = cleaned
+            time.sleep(0.2)
+
     out: list[str] = []
     for i, line in enumerate(lines):
         out.append(line)
@@ -464,7 +522,36 @@ def process_file(
             out.append('{"' + escape_translation(translations[i]) + '"}')
 
     path.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8", newline="\n")
-    return bool(need_llm or stats.translated), stats
+
+    final_lines = path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+    stats.still_missing = len(find_missing_translations(final_lines))
+    complete = stats.still_missing == 0
+    changed = stats.translated > 0
+    return changed, stats, complete
+
+
+def format_file_summary(stats: ProcessStats) -> str:
+    if stats.translated:
+        msg = f"写入 {stats.translated} 行对照"
+        if stats.retried:
+            msg += f"（含补翻 {stats.retried} 行）"
+        if stats.still_missing:
+            msg += f"，仍缺 {stats.still_missing} 行"
+        return msg
+    parts: list[str] = []
+    if stats.skipped_chinese:
+        parts.append(f"中文原文 {stats.skipped_chinese} 行")
+    if stats.skipped_sound: 
+        parts.append(f"拟声 {stats.skipped_sound} 行")
+    if stats.skipped_meta:
+        parts.append(f"元数据 {stats.skipped_meta} 行")
+    if stats.dropped_redundant:
+        parts.append(f"丢弃重复 {stats.dropped_redundant} 行")
+    if stats.dropped_invalid:
+        parts.append(f"丢弃无效 {stats.dropped_invalid} 行")
+    if not parts:
+        return "无可翻译内容"
+    return "无需翻译（" + "，".join(parts) + "）"
 
 
 def worker(
@@ -474,12 +561,14 @@ def worker(
     model: str,
     batch_size: int,
     replace_existing: bool,
-) -> tuple[str, bool, ProcessStats, str | None]:
+) -> tuple[str, bool, ProcessStats, bool, str | None]:
     try:
-        ok, stats = process_file(path, api_key, base_url, model, batch_size, replace_existing)
-        return path.name, ok, stats, None
+        ok, stats, complete = process_file(
+            path, api_key, base_url, model, batch_size, replace_existing
+        )
+        return path.name, ok, stats, complete, None
     except Exception as e:
-        return path.name, False, ProcessStats(), str(e)
+        return path.name, False, ProcessStats(), False, str(e)
 
 
 def main() -> int:
@@ -489,6 +578,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="LLM 批量添加 LRC 中文对照（优化版）")
     parser.add_argument("--file", type=Path, help="只处理单个 lrc 文件")
     parser.add_argument("--replace-existing", action="store_true", help="覆盖已有对照行")
+    parser.add_argument(
+        "--retry-incomplete",
+        action="store_true",
+        help="补翻已有 checkpoint 但对照不完整的文件",
+    )
     args = parser.parse_args()
 
     api_key = os.environ.get("LLM_API_KEY", "").strip()
@@ -510,12 +604,17 @@ def main() -> int:
 
     if args.file:
         files = [args.file if args.file.is_absolute() else PROJECT / args.file]
+    elif args.retry_incomplete:
+        files = [p for p in sorted(ROOT.glob("*.lrc")) if file_has_missing_translations(p)]
     else:
         _done = load_checkpoint()
         files = [p for p in sorted(ROOT.glob("*.lrc")) if p.name not in _done]
 
     if not files:
-        print("没有待处理的文件")
+        if args.retry_incomplete:
+            print("没有对照不完整的文件")
+        else:
+            print("没有待处理的文件")
         return 0
 
     opencc_hint = "已启用" if _CC else "未启用（可 pip install opencc-python-reimplemented）"
@@ -525,7 +624,7 @@ def main() -> int:
         flush=True,
     )
 
-    changed = errors = 0
+    changed = errors = incomplete = 0
     totals = ProcessStats()
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -536,23 +635,31 @@ def main() -> int:
             for p in files
         }
         for n, fut in enumerate(as_completed(futs), 1):
-            name, did, stats, err = fut.result()
+            name, did, stats, complete, err = fut.result()
             if err:
                 errors += 1
                 print(f"[{n}/{len(files)}] 错误 {name}: {err}", flush=True)
             else:
-                if not args.file:
+                if not args.file and complete:
                     with _lock:
                         _done.add(name)
-                if did:
+                elif not args.file and not complete:
+                    incomplete += 1
+                summary = format_file_summary(stats)
+                if stats.translated:
                     changed += 1
-                    print(f"[{n}/{len(files)}] 完成 {name}", flush=True)
+                    tag = "完成" if complete else "部分"
+                    print(f"[{n}/{len(files)}] {tag} {name}：{summary}", flush=True)
+                else:
+                    print(f"[{n}/{len(files)}] 跳过 {name}：{summary}", flush=True)
                 totals.translated += stats.translated
                 totals.skipped_chinese += stats.skipped_chinese
                 totals.skipped_sound += stats.skipped_sound
                 totals.skipped_meta += stats.skipped_meta
                 totals.dropped_redundant += stats.dropped_redundant
                 totals.dropped_invalid += stats.dropped_invalid
+                totals.still_missing += stats.still_missing
+                totals.retried += stats.retried
             if not args.file and n % 20 == 0:
                 save_checkpoint()
 
@@ -560,12 +667,30 @@ def main() -> int:
         save_checkpoint()
 
     print(
-        f"全部结束：已更新 {changed} 个文件，失败 {errors} 个 | "
-        f"写入对照 {totals.translated} 行，跳过中文原文 {totals.skipped_chinese} 行，"
-        f"跳过拟声 {totals.skipped_sound} 行，跳过元数据 {totals.skipped_meta} 行，"
-        f"丢弃重复 {totals.dropped_redundant} 行，丢弃无效 {totals.dropped_invalid} 行",
+        f"全部结束：已写入对照 {changed} 个文件，"
+        f"不完整 {incomplete} 个，跳过 {len(files) - changed - errors - incomplete} 个，失败 {errors} 个",
         flush=True,
     )
+    print(
+        f"统计：写入对照 {totals.translated} 行 | "
+        f"仍缺对照 {totals.still_missing} 行 | "
+        f"跳过中文原文 {totals.skipped_chinese} 行，"
+        f"跳过拟声 {totals.skipped_sound} 行，"
+        f"跳过元数据 {totals.skipped_meta} 行，"
+        f"丢弃重复 {totals.dropped_redundant} 行，"
+        f"丢弃无效 {totals.dropped_invalid} 行",
+        flush=True,
+    )
+    if incomplete:
+        print(
+            "提示：不完整文件未写入 checkpoint，请用 --retry-incomplete 继续补翻。",
+            flush=True,
+        )
+    if changed == 0 and errors == 0 and len(files) <= 10:
+        print(
+            "提示：若本批文件均为中文歌词或「暂无歌词」占位，则不会调用 LLM，属正常情况。",
+            flush=True,
+        )
     return 1 if errors else 0
 
 
