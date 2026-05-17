@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
-用大模型为 LRC 添加 {"中文对照"} 行（OpenAI 兼容 API：DeepSeek / OpenAI / 通义 / Moonshot 等）。
+用大模型为 LRC 添加 {"中文对照"} 行（OpenAI 兼容 API）。
 
-环境变量（必填其一）:
-  LLM_API_KEY          API Key
+优化要点：
+- 本地预过滤：中文原文、拟声/口号、元数据行不调用 LLM
+- 对照仅输出简体中文，拒绝中译中重复
+- 校验失败时重试单批；checkpoint 仅记录成功处理的文件
+
+环境变量:
+  LLM_API_KEY          必填
   LLM_BASE_URL         默认 https://api.deepseek.com
   LLM_MODEL            默认 deepseek-chat
-
-可选:
-  LLM_BATCH_LINES      每次请求翻译行数，默认 25
-  LLM_WORKERS          并发文件数，默认 3
-  LLM_REPLACE_EXISTING 设为 1 时覆盖已有 {"..."} 对照（用于替换机翻）
+  LLM_BATCH_LINES      默认 25
+  LLM_WORKERS          默认 3
+  LLM_REPLACE_EXISTING 设为 1 覆盖已有对照
 
 用法:
-  export LLM_API_KEY=sk-...
   python3 scripts/add_lrc_zh_translations_llm.py
   python3 scripts/add_lrc_zh_translations_llm.py --file lyrics/5000.lrc
   LLM_REPLACE_EXISTING=1 python3 scripts/add_lrc_zh_translations_llm.py
@@ -31,7 +33,16 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
+
+try:
+    from opencc import OpenCC
+
+    _CC = OpenCC("t2s")
+except ImportError:
+    _CC = None
 
 PROJECT = Path(__file__).resolve().parents[1]
 ROOT = PROJECT / "lyrics"
@@ -40,18 +51,63 @@ ENV_FILE = PROJECT / ".env"
 PLACEHOLDER = "Neko云音乐 暂无歌词"
 
 TS_LINE = re.compile(r"^(\[\d{1,2}:\d{2}(?:[\.:]\d+)?\])(.*)$")
-JSON_LINE = re.compile(r"^\s*\{.*\}\s*$")
+JSON_LINE = re.compile(r'^\s*\{"((?:[^"\\]|\\.)*)"\}\s*$')
 
-SYSTEM_PROMPT = """你是专业歌词翻译，为音乐 App 的 LRC 歌词提供中文对照行。
+SIMILARITY_THRESHOLD = 0.85
+
+METADATA_PREFIXES = (
+    "词",
+    "曲",
+    "编曲",
+    "制作人",
+    "监制",
+    "混音",
+    "录音",
+    "出品",
+    "发行",
+    "作词",
+    "作曲",
+    "原唱",
+    "演唱",
+    "翻译",
+    "Lyrics",
+    "Music",
+    "Arrange",
+    "Produced",
+    "Written",
+    "Composed",
+    "Translator",
+)
+
+_NONSENSE_TOKENS = frozenset(
+    """
+    na la lila lalala balaba bala baraba nanana oh ah uh ooh woo hoo hey yo yeah
+    yeh sha boom clap da di do pa pi pu ba tra ra ta ma ha he ho hu ding dong ring
+    """.split()
+)
+
+SYSTEM_PROMPT = """你是专业歌词翻译，为音乐 App 的 LRC 提供「简体中文对照」行。
 
 要求：
-1. 忠实原意，符合歌词语境、情感和语气（口语/诗意/动漫台词等）
-2. 中文自然流畅，避免机翻腔和生硬直译
-3. 保留专有名词、乐队名、角色名等可音译或业界通用译名
-4. 行数与输入严格一一对应，不要合并或拆分
-5. 可适当用全角空格「　」分隔意群，与常见 LRC 对照风格一致
-6. 只输出 JSON，格式为 {"lines": ["翻译1", "翻译2", ...]}，不要其它说明
-7. 如果原文本身就是中文，对应项返回空字符串 ""，不要重复翻译"""
+1. 忠实原意，符合歌词语境、情感与语气
+2. 只使用简体中文与中文标点、数字、全角空格「　」，不得出现英文字母、日文假名、韩文、繁体字
+3. 行数与输入严格一一对应，不合并、不拆分
+4. 只输出 JSON：{"lines": ["...", ...]}
+5. 以下情况对应项必须返回空字符串 ""：
+   - 原文已是中文（无需中译中）
+   - 拟声/口号/无意义音节（如 Na lila balaba、Lalala、Oh oh oh）
+   - 纯演奏信息、制作人名单、时间轴标注等非歌词内容"""
+
+
+@dataclass
+class ProcessStats:
+    translated: int = 0
+    skipped_chinese: int = 0
+    skipped_sound: int = 0
+    skipped_meta: int = 0
+    dropped_redundant: int = 0
+    dropped_invalid: int = 0
+
 
 _lock = threading.Lock()
 _done: set[str] = set()
@@ -92,8 +148,172 @@ def save_checkpoint() -> None:
         )
 
 
+def cjk_count(s: str) -> int:
+    return sum(1 for c in s if "\u4e00" <= c <= "\u9fff" or "\u3400" <= c <= "\u4dbf")
+
+
+def kana_count(s: str) -> int:
+    return sum(1 for c in s if "\u3040" <= c <= "\u30ff")
+
+
+def hangul_count(s: str) -> int:
+    return sum(1 for c in s if "\uac00" <= c <= "\ud7a3" or "\u1100" <= c <= "\u11ff")
+
+
+def latin_count(s: str) -> int:
+    return sum(1 for c in s if c.isalpha() and ord(c) < 0x300)
+
+
+def meaningful_chars(s: str) -> int:
+    return sum(
+        1
+        for c in s
+        if not c.isspace()
+        and c not in "，。、；：？！…—·「」『』（）【】[](){}:;,.!?\'\"-"
+    )
+
+
+def is_metadata_line(text: str) -> bool:
+    t = text.strip()
+    if not t:
+        return True
+    if PLACEHOLDER in t:
+        return True
+    return any(t.startswith(p) for p in METADATA_PREFIXES)
+
+
+def is_chinese_dominant(s: str) -> bool:
+    if kana_count(s) >= 1 or hangul_count(s) >= 1:
+        return False
+    cjk = cjk_count(s)
+    latin = latin_count(s)
+    m = meaningful_chars(s)
+    if m == 0:
+        return False
+    if cjk >= 1 and latin == 0:
+        return True
+    return cjk >= 2 and cjk / m >= 0.4 and latin <= max(2, cjk * 0.15)
+
+
+def latin_tokens(s: str) -> list[str]:
+    return re.findall(r"[a-zA-Z]+", s.lower())
+
+
+def is_syllable_repeat_token(token: str) -> bool:
+    return len(token) >= 4 and bool(
+        re.fullmatch(r"(?:la|na|oh|ha|ba|da|di|do|pa|sha|woo|lila|bala)+", token)
+    )
+
+
+def is_untranslatable_sound(s: str) -> bool:
+    if cjk_count(s) > 0 or kana_count(s) > 0 or hangul_count(s) > 0:
+        return False
+    if latin_count(s) < 3:
+        return False
+    tokens = latin_tokens(s)
+    if not tokens:
+        return False
+    if len(tokens) == 1 and is_syllable_repeat_token(tokens[0]):
+        return True
+    if len(tokens) <= 12 and all(
+        t in _NONSENSE_TOKENS or is_syllable_repeat_token(t) for t in tokens
+    ):
+        return True
+    return False
+
+
+def normalize_text(s: str) -> str:
+    s = re.sub(r"[\s　]+", "", s)
+    s = re.sub(r"[，。、；：？！…—·「」『』（）【】\[\](){}:;,.!?\'\"\-]", "", s)
+    return s.lower()
+
+
+def similarity(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def is_redundant_zh_pair(orig: str, trans: str) -> bool:
+    if not is_chinese_dominant(orig) or not is_chinese_dominant(trans):
+        return False
+    o, t = normalize_text(orig), normalize_text(trans)
+    if not o or not t:
+        return False
+    return o == t or similarity(o, t) >= SIMILARITY_THRESHOLD
+
+
+def has_traditional(s: str) -> bool:
+    if _CC is None:
+        return False
+    han = "".join(c for c in s if "\u4e00" <= c <= "\u9fff")
+    return bool(han) and _CC.convert(han) != han
+
+
+def is_pure_simplified_zh(s: str) -> bool:
+    if not s.strip():
+        return True
+    if kana_count(s) or hangul_count(s) or latin_count(s):
+        return False
+    if re.search(r"[\u0400-\u04FF]", s):
+        return False
+    if has_traditional(s):
+        return False
+    allowed = set("，。、；：？！…—·「」『』（）【】《》〈〉""''　()[]*~/@#%&+=<>|^_.\"'-")
+    for c in s:
+        if c.isspace() or c in allowed:
+            continue
+        if c.isdigit():
+            continue
+        if "\u4e00" <= c <= "\u9fff" or "\u3400" <= c <= "\u4dbf":
+            continue
+        if ord(c) < 128 and not c.isalpha():
+            continue
+        return False
+    return True
+
+
+def to_simplified(s: str) -> str:
+    if _CC is None:
+        return s
+    return _CC.convert(s)
+
+
+def classify_skip(lyric: str) -> str | None:
+    if is_metadata_line(lyric):
+        return "meta"
+    if is_chinese_dominant(lyric):
+        return "chinese"
+    if is_untranslatable_sound(lyric):
+        return "sound"
+    return None
+
+
+def sanitize_translation(orig: str, trans: str, stats: ProcessStats) -> str:
+    trans = to_simplified(trans.strip())
+    if not trans:
+        return ""
+    if classify_skip(orig):
+        stats.dropped_invalid += 1
+        return ""
+    if not is_pure_simplified_zh(trans):
+        stats.dropped_invalid += 1
+        return ""
+    if is_redundant_zh_pair(orig, trans):
+        stats.dropped_redundant += 1
+        return ""
+    return trans
+
+
 def escape_translation(text: str) -> str:
     return text.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def parse_json_line(line: str) -> str | None:
+    m = JSON_LINE.match(line.strip())
+    if not m:
+        return None
+    return m.group(1).replace('\\"', '"').replace("\\\\", "\\")
 
 
 def chat_translate(lines: list[str], api_key: str, base_url: str, model: str) -> list[str]:
@@ -101,7 +321,7 @@ def chat_translate(lines: list[str], api_key: str, base_url: str, model: str) ->
         return []
     payload = {
         "model": model,
-        "temperature": 0.3,
+        "temperature": 0.25,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {
@@ -133,13 +353,32 @@ def chat_translate(lines: list[str], api_key: str, base_url: str, model: str) ->
             data = json.loads(content)
             out = data.get("lines") or data.get("translations") or data.get("result")
             if not isinstance(out, list) or len(out) != len(lines):
-                raise ValueError(f"bad LLM JSON shape or length: {content[:200]}")
+                raise ValueError(f"LLM 返回 JSON 格式或行数不正确: {content[:200]}")
             return [str(x) for x in out]
-        except (urllib.error.HTTPError, urllib.error.URLError, ValueError, KeyError, json.JSONDecodeError) as e:
+        except (
+            urllib.error.HTTPError,
+            urllib.error.URLError,
+            ValueError,
+            KeyError,
+            json.JSONDecodeError,
+        ) as e:
             wait = min(60, 2 ** attempt)
-            print(f"    LLM retry {attempt + 1}: {e}", flush=True)
+            print(f"    LLM 重试第 {attempt + 1} 次: {e}", flush=True)
             time.sleep(wait)
-    raise RuntimeError("LLM translation failed after retries")
+    raise RuntimeError("LLM 翻译失败：已重试多次仍无响应")
+
+
+def strip_existing_translations(lines: list[str]) -> list[str]:
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        if TS_LINE.match(line) and i + 1 < len(lines) and JSON_LINE.match(lines[i + 1].strip()):
+            i += 2
+            continue
+        i += 1
+    return out
 
 
 def collect_pending(lines: list[str], replace_existing: bool) -> list[tuple[int, str]]:
@@ -156,7 +395,7 @@ def collect_pending(lines: list[str], replace_existing: bool) -> list[tuple[int,
         if not lyric:
             continue
         nxt = lines[i + 1].strip() if i + 1 < len(lines) else ""
-        has_tr = bool(JSON_LINE.match(nxt))
+        has_tr = parse_json_line(nxt) is not None
         if has_tr and not replace_existing:
             skip_next = True
             continue
@@ -173,38 +412,49 @@ def process_file(
     model: str,
     batch_size: int,
     replace_existing: bool,
-) -> bool:
+) -> tuple[bool, ProcessStats]:
+    stats = ProcessStats()
     text = path.read_text(encoding="utf-8-sig", errors="replace")
-    if PLACEHOLDER in text:
-        return False
+    if PLACEHOLDER in text and PLACEHOLDER == text.strip():
+        return False, stats
 
     lines = text.splitlines()
-    pending = collect_pending(lines, replace_existing)
-    if not pending:
-        return False
-
-    # 若覆盖模式，先去掉旧的对照行
     if replace_existing:
-        new_lines: list[str] = []
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            new_lines.append(line)
-            if TS_LINE.match(line) and i + 1 < len(lines) and JSON_LINE.match(lines[i + 1].strip()):
-                i += 2
-                continue
-            i += 1
-        lines = new_lines
-        pending = collect_pending(lines, False)
+        lines = strip_existing_translations(lines)
 
-    translations: dict[int, str] = {}
-    for start in range(0, len(pending), batch_size):
-        chunk = pending[start : start + batch_size]
+    pending = collect_pending(lines, False)
+    if not pending:
+        return False, stats
+
+    need_llm: list[tuple[int, str]] = []
+    local_empty: dict[int, str] = {}
+
+    for i, lyric in pending:
+        reason = classify_skip(lyric)
+        if reason == "meta":
+            stats.skipped_meta += 1
+            local_empty[i] = ""
+        elif reason == "chinese":
+            stats.skipped_chinese += 1
+            local_empty[i] = ""
+        elif reason == "sound":
+            stats.skipped_sound += 1
+            local_empty[i] = ""
+        else:
+            need_llm.append((i, lyric))
+
+    translations: dict[int, str] = dict(local_empty)
+
+    for start in range(0, len(need_llm), batch_size):
+        chunk = need_llm[start : start + batch_size]
         idxs = [i for i, _ in chunk]
         src = [t for _, t in chunk]
-        zh = chat_translate(src, api_key, base_url, model)
-        for i, t in zip(idxs, zh):
-            translations[i] = t
+        raw = chat_translate(src, api_key, base_url, model)
+        for idx, orig, trans in zip(idxs, src, raw):
+            cleaned = sanitize_translation(orig, trans, stats)
+            if cleaned:
+                stats.translated += 1
+            translations[idx] = cleaned
         time.sleep(0.2)
 
     out: list[str] = []
@@ -214,7 +464,7 @@ def process_file(
             out.append('{"' + escape_translation(translations[i]) + '"}')
 
     path.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8", newline="\n")
-    return True
+    return bool(need_llm or stats.translated), stats
 
 
 def worker(
@@ -224,19 +474,19 @@ def worker(
     model: str,
     batch_size: int,
     replace_existing: bool,
-) -> tuple[str, bool, str | None]:
+) -> tuple[str, bool, ProcessStats, str | None]:
     try:
-        ok = process_file(path, api_key, base_url, model, batch_size, replace_existing)
-        return path.name, ok, None
+        ok, stats = process_file(path, api_key, base_url, model, batch_size, replace_existing)
+        return path.name, ok, stats, None
     except Exception as e:
-        return path.name, False, str(e)
+        return path.name, False, ProcessStats(), str(e)
 
 
 def main() -> int:
     global _done
     load_dotenv()
 
-    parser = argparse.ArgumentParser(description="LLM 批量添加 LRC 中文对照")
+    parser = argparse.ArgumentParser(description="LLM 批量添加 LRC 中文对照（优化版）")
     parser.add_argument("--file", type=Path, help="只处理单个 lrc 文件")
     parser.add_argument("--replace-existing", action="store_true", help="覆盖已有对照行")
     args = parser.parse_args()
@@ -246,8 +496,8 @@ def main() -> int:
         print(
             "请设置 LLM_API_KEY，例如：\n"
             "  export LLM_API_KEY=sk-...\n"
-            "  export LLM_BASE_URL=https://api.deepseek.com   # 可选\n"
-            "  export LLM_MODEL=deepseek-chat                   # 可选",
+            "  export LLM_BASE_URL=https://api.deepseek.com\n"
+            "  export LLM_MODEL=deepseek-chat",
             file=sys.stderr,
         )
         return 2
@@ -259,20 +509,24 @@ def main() -> int:
     replace_existing = args.replace_existing or env_bool("LLM_REPLACE_EXISTING")
 
     if args.file:
-        files = [args.file if args.file.is_absolute() else ROOT.parent / args.file]
+        files = [args.file if args.file.is_absolute() else PROJECT / args.file]
     else:
         _done = load_checkpoint()
         files = [p for p in sorted(ROOT.glob("*.lrc")) if p.name not in _done]
 
     if not files:
-        print("nothing to do")
+        print("没有待处理的文件")
         return 0
 
+    opencc_hint = "已启用" if _CC else "未启用（可 pip install opencc-python-reimplemented）"
     print(
-        f"LLM translate: {len(files)} files, model={model}, batch={batch_size}, workers={workers}",
+        f"开始翻译：共 {len(files)} 个文件，模型={model}，每批={batch_size} 行，"
+        f"并发={workers}，繁转简={opencc_hint}",
         flush=True,
     )
+
     changed = errors = 0
+    totals = ProcessStats()
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futs = {
@@ -282,22 +536,36 @@ def main() -> int:
             for p in files
         }
         for n, fut in enumerate(as_completed(futs), 1):
-            name, did, err = fut.result()
-            if not args.file:
-                with _lock:
-                    _done.add(name)
+            name, did, stats, err = fut.result()
             if err:
                 errors += 1
-                print(f"[{n}/{len(files)}] ERR {name}: {err}", flush=True)
-            elif did:
-                changed += 1
-                print(f"[{n}/{len(files)}] + {name}", flush=True)
+                print(f"[{n}/{len(files)}] 错误 {name}: {err}", flush=True)
+            else:
+                if not args.file:
+                    with _lock:
+                        _done.add(name)
+                if did:
+                    changed += 1
+                    print(f"[{n}/{len(files)}] 完成 {name}", flush=True)
+                totals.translated += stats.translated
+                totals.skipped_chinese += stats.skipped_chinese
+                totals.skipped_sound += stats.skipped_sound
+                totals.skipped_meta += stats.skipped_meta
+                totals.dropped_redundant += stats.dropped_redundant
+                totals.dropped_invalid += stats.dropped_invalid
             if not args.file and n % 20 == 0:
                 save_checkpoint()
 
     if not args.file:
         save_checkpoint()
-    print(f"done changed={changed} errors={errors}")
+
+    print(
+        f"全部结束：已更新 {changed} 个文件，失败 {errors} 个 | "
+        f"写入对照 {totals.translated} 行，跳过中文原文 {totals.skipped_chinese} 行，"
+        f"跳过拟声 {totals.skipped_sound} 行，跳过元数据 {totals.skipped_meta} 行，"
+        f"丢弃重复 {totals.dropped_redundant} 行，丢弃无效 {totals.dropped_invalid} 行",
+        flush=True,
+    )
     return 1 if errors else 0
 
 
