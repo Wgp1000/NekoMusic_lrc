@@ -314,10 +314,26 @@ def sanitize_translation(orig: str, trans: str, stats: ProcessStats) -> str:
     if is_redundant_zh_pair(orig, trans):
         stats.dropped_redundant += 1
         return ""
-    return trans
+    return clean_translation_text(trans)
+
+
+def clean_translation_text(text: str) -> str:
+    """去掉误转义，英文双引号改为中文引号，避免写入 {\\\"...\\\"}。"""
+    text = text.strip()
+    text = text.replace('\\"', '"').replace("\\\\", "\\")
+    while len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+        inner = text[1:-1].strip()
+        if '"' not in inner:
+            text = inner
+        else:
+            break
+    text = re.sub(r'"([^"]*)"', r"「\1」", text)
+    text = text.replace('"', "")
+    return text.strip()
 
 
 def escape_translation(text: str) -> str:
+    text = clean_translation_text(text)
     return text.replace("\\", "\\\\").replace('"', '\\"')
 
 
@@ -325,7 +341,50 @@ def parse_json_line(line: str) -> str | None:
     m = JSON_LINE.match(line.strip())
     if not m:
         return None
-    return m.group(1).replace('\\"', '"').replace("\\\\", "\\")
+    return clean_translation_text(
+        m.group(1).replace('\\"', '"').replace("\\\\", "\\")
+    )
+
+
+def extract_translation_inner(line: str) -> str | None:
+    """从对照行解析正文，兼容误转义与 {"{" 损坏格式。"""
+    s = line.strip()
+    if not s.startswith('{"') or not s.endswith('"}'):
+        return None
+    inner = s[2:-2]
+    if inner.startswith('{"') and inner.endswith('"}'):
+        inner = inner[2:-2]
+    return clean_translation_text(inner.replace('\\"', '"').replace("\\\\", "\\"))
+
+
+def format_translation_line(line: str, inner: str) -> str:
+    indent = line[: len(line) - len(line.lstrip())]
+    return f'{indent}{{"' + escape_translation(inner) + '"}}'
+
+
+def fix_escaped_quotes_in_file(path: Path) -> int:
+    lines = path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+    changed = 0
+    out: list[str] = []
+    for line in lines:
+        inner = extract_translation_inner(line)
+        needs_fix = False
+        if inner is not None:
+            raw = line.strip()[2:-2]
+            if raw.startswith('{"') or '\\"' in raw or raw != escape_translation(inner):
+                needs_fix = True
+        if needs_fix and inner is not None:
+            out.append(format_translation_line(line, inner))
+            changed += 1
+        else:
+            out.append(line)
+    if changed:
+        text = "\n".join(out)
+        orig = path.read_text(encoding="utf-8-sig", errors="replace")
+        if orig.endswith("\n"):
+            text += "\n"
+        path.write_text(text, encoding="utf-8", newline="\n")
+    return changed
 
 
 def chat_translate(lines: list[str], api_key: str, base_url: str, model: str) -> list[str]:
@@ -583,7 +642,27 @@ def main() -> int:
         action="store_true",
         help="补翻已有 checkpoint 但对照不完整的文件",
     )
+    parser.add_argument(
+        "--fix-escaped-quotes",
+        action="store_true",
+        help="修复对照行中误加的 \\\" 转义（不改其它内容）",
+    )
     args = parser.parse_args()
+
+    if args.fix_escaped_quotes:
+        targets = (
+            [args.file if args.file.is_absolute() else PROJECT / args.file]
+            if args.file
+            else sorted(ROOT.glob("*.lrc"))
+        )
+        total = 0
+        for p in targets:
+            n = fix_escaped_quotes_in_file(p)
+            if n:
+                total += n
+                print(f"修复 {p.name}: {n} 行", flush=True)
+        print(f"共修复 {total} 行", flush=True)
+        return 0
 
     api_key = os.environ.get("LLM_API_KEY", "").strip()
     if not api_key:
