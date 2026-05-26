@@ -1,5 +1,4 @@
 __pycache__
-.env
 .lrc_llm_translation_checkpoint.json
 .lrc_translation_checkpoint.json
 lrc_non_chinese.txt
